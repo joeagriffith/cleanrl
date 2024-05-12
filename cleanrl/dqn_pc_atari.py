@@ -21,6 +21,7 @@ from stable_baselines3.common.atari_wrappers import (
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -49,7 +50,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "BreakoutNoFrameskip-v4"
     """the id of the environment"""
-    total_timesteps: int = 1500000
+    total_timesteps: int = 10000000
     """total timesteps of the experiments"""
     learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
@@ -71,14 +72,10 @@ class Args:
     """the ending epsilon for exploration"""
     exploration_fraction: float = 0.10
     """the fraction of `total-timesteps` it takes from start-e to go end-e"""
-    learning_starts: int = 1000
+    learning_starts: int = 80000
     """timestep to start learning"""
     train_frequency: int = 4
     """the frequency of training"""
-    K: int = 512
-    """the number of embeddings in the VQ-VAE"""
-    beta: float = 0.25
-    """the beta value in the VQ-VAE"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -108,73 +105,74 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
-    def __init__(self, env, K, beta):
+    def __init__(self, env):
         super().__init__()
+        self.n_action_space = env.single_action_space.n
         self.encoder = nn.Sequential(
-            nn.Conv2d(4, 32, 4, stride=4),
+            nn.Conv2d(4, 32, 8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2),
+            nn.Conv2d(32, 64, 4, stride=2),
             nn.ReLU(),
             nn.Conv2d(64, 64, 3, stride=1),
             nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(3136, 512),
         )
-        self.embedding = nn.Embedding(num_embeddings=K, embedding_dim=64)
-
-        self.beta = beta
-
         self.decoder = nn.Sequential(
+            nn.Linear(512, 3136),
+            nn.Unflatten(1, (64, 7, 7)),
+
             nn.ConvTranspose2d(64, 64, 3, stride=1),
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 3, stride=2),
+            nn.BatchNorm2d(64),
+
+            nn.ConvTranspose2d(64, 32, 4, stride=2),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, 4, 4, stride=4),
+            nn.BatchNorm2d(32),
+
+            nn.ConvTranspose2d(32, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
+
+            nn.Conv2d(32, 4, 3, padding=1),
             nn.Sigmoid(),
         )
 
-        self.network = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(4096, 512),
+        self.action_encoder = nn.Sequential(
+            nn.Linear(self.n_action_space, 512),
             nn.ReLU(),
-            nn.Linear(512, env.single_action_space.n),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 64),
         )
-    
-    def encode(self, x):
-        enc = self.encoder(x / 255.0)
-        quant_input = enc.permute(0, 2, 3, 1).reshape(enc.shape[0], -1, enc.shape[1])
-        distances = torch.cdist(quant_input, self.embedding.weight[None, :].repeat(quant_input.shape[0], 1, 1))
-        min_enc_indices = torch.argmin(distances, dim=-1)
 
-        quant_out = torch.index_select(self.embedding.weight, 0, min_enc_indices.flatten())
-        quant_input = quant_input.reshape((-1, quant_input.shape[-1]))
+        self.transition = nn.Sequential(
+            nn.Linear(512+64, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+        )
 
-        commitment_loss = torch.mean((quant_out.detach() - quant_input) ** 2)
-        codebook_loss = torch.mean((quant_out - quant_input.detach()) ** 2)
-        quant_loss = codebook_loss + self.beta * commitment_loss
+        self.network = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, self.n_action_space),
+        )
 
-        quant_out = quant_input + (quant_out - quant_input).detach()
-        quant_out = quant_out.reshape(enc.shape[0], enc.shape[2], enc.shape[3], enc.shape[1]).permute(0, 3, 1, 2)
+    def predict_next_state(self, obs, action):
+        obs = obs / 255.0
+        action = F.one_hot(action.long(), num_classes=self.n_action_space).float().squeeze(1)
+        z = self.encoder(obs)
+        a = self.action_encoder(action.float())
+        z = torch.cat([z, a], dim=1)
+        z = self.transition(z)
+        return self.decoder(z)
 
-        return quant_out, quant_loss
-
-    def reconstruct(self, x):
+    def forward(self, x):
         x = x / 255.0
-        quant_out, _ = self.encode(x)
-        return self.decoder(quant_out) * 255.0
-    
-    def forward(self, x, losses=False):
-        x = x / 255.0
-        if losses:
-            quant_out, quant_loss = self.encode(x)
-            dec = self.decoder(quant_out)
-            reconstruction_loss = F.mse_loss(dec, x)
-            q_values = self.network(quant_out.detach())
-            return q_values, reconstruction_loss, quant_loss
-
-        else:
-            quant_out, _ = self.encode(x)
-            q_values = self.network(quant_out)
-            return q_values
-
+        z = self.encoder(x)
+        return self.network(z.detach())
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
@@ -193,7 +191,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
         )
     args = tyro.cli(Args)
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}__K{args.K}__beta{args.beta}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -226,9 +224,9 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    q_network = QNetwork(envs, args.K, args.beta).to(device)
+    q_network = QNetwork(envs).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
-    target_network = QNetwork(envs, args.K, args.beta).to(device)
+    target_network = QNetwork(envs).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
     rb = ReplayBuffer(
@@ -245,9 +243,8 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
     obs, _ = envs.reset(seed=args.seed)
 
     r_thresholds = [0, 2, 10, 50, 150]
-    raw_obs_states = [torch.Tensor(obs)]
-    # write initial ground truth observation
-    writer.add_image("reconstruction/r0", obs[0], 0, dataformats="CHW")
+    # [(obs, action, next_obs)]
+    transitions = []
 
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
@@ -269,10 +266,11 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
-                    # Collect raw observations at different stages of the game for reconstruction evaluation
-                    if len(raw_obs_states) < 5 and info["episode"]["r"] > r_thresholds[len(raw_obs_states)]:
-                        raw_obs_states.append(torch.Tensor(obs))
-                        writer.add_image(f"reconstruction/r{r_thresholds[len(raw_obs_states) - 1]}", obs[0], global_step, dataformats="CHW")
+        # Collect raw observations for the state space analysis
+        if len(transitions) < 5 and info["episode"]["r"] >= r_thresholds[len(transitions)]:
+            transitions.append((obs, actions, next_obs))
+            writer.add_image(f"state prediction/{len(transitions)-1}", next_obs[0], global_step, dataformats="CHW")
+                        
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -291,19 +289,21 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                 with torch.no_grad():
                     target_max, _ = target_network(data.next_observations).max(dim=1)
                     td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
-                q_values, reconstruction_loss, quant_loss = q_network(data.observations, losses=True)
-                old_val = q_values.gather(1, data.actions).squeeze()
+                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
                 td_loss = F.mse_loss(td_target, old_val)
+
+                pred_next_obs = q_network.predict_next_state(data.observations, data.actions)
+                # pc_loss = F.mse_loss(pred_next_obs, data.next_observations / 255.0)
+                pc_loss = F.binary_cross_entropy(pred_next_obs, data.next_observations / 255.0)
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", td_loss, global_step)
-                    writer.add_scalar("losses/reconstruction_loss", reconstruction_loss, global_step)
-                    writer.add_scalar("losses/quant_loss", quant_loss, global_step)
+                    writer.add_scalar("losses/reconstruction_loss", pc_loss, global_step)
                     writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-                loss = td_loss + reconstruction_loss + quant_loss
+                loss = td_loss + pc_loss
 
                 # optimize the model
                 optimizer.zero_grad()
@@ -317,11 +317,11 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                         args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                     )
         
-        # Reconstruction Eval
-        if global_step % 10000 == 0:
-            for idx, raw_obs in enumerate(raw_obs_states):
-                reconstructed_obs = q_network.reconstruct(raw_obs.to(device)).cpu().detach().numpy()
-                writer.add_image(f"reconstruction/r{r_thresholds[idx]}", reconstructed_obs[0].clip(0, 255).astype(np.uint8), global_step, dataformats="CHW")
+        # Prediction eval
+        if global_step % 100000 == 0:
+            for idx, (obs, action, next_obs) in enumerate(transitions):
+                pred_next_obs = q_network.predict_next_state(torch.Tensor(obs).to(device), torch.Tensor(action).to(device)).cpu().detach().numpy()
+                writer.add_image(f"state prediction/{idx}", (pred_next_obs[0] * 255.0).clip(0, 255).astype(np.uint8), global_step, dataformats="CHW")
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
