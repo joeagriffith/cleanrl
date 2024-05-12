@@ -707,7 +707,6 @@ class TrajectoryBuffer(BaseBuffer):
     :param buffer_size: Max number of element in the buffer
     :param observation_space: Observation space
     :param action_space: Action space
-    :param horizon: Length of the trajectory
     :param device:
     :param n_envs: Number of parallel environments
     :param optimize_memory_usage: Enable a memory efficient variant
@@ -722,12 +721,10 @@ class TrajectoryBuffer(BaseBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        horizon: int,
         device: Union[th.device, str] = "cpu",
         n_envs: int = 1,
     ):
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
-        self.horizon = horizon
 
         assert n_envs == 1, "Replay buffer only support single environment for now"
 
@@ -769,7 +766,7 @@ class TrajectoryBuffer(BaseBuffer):
             self.full = True
             self.pos = 0
 
-    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+    def sample(self, batch_size: int, horizon: int, dilation: int, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
         """
         Sample elements from the replay buffer.
         Custom sampling when using memory efficient variant,
@@ -784,16 +781,16 @@ class TrajectoryBuffer(BaseBuffer):
         # Do not sample the element with index `self.pos` as the transitions is invalid
         # (we use only one array to store `obs` and `next_obs`)
         if self.full:
-            batch_inds = (np.random.randint(1 + self.horizon, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
+            batch_inds = (np.random.randint(1 + (horizon*dilation), self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
         else:
-            batch_inds = np.random.randint(self.horizon, self.pos, size=batch_size)
-        return self._get_samples(batch_inds, env=env)
+            batch_inds = np.random.randint((horizon*dilation), self.pos, size=batch_size)
+        return self._get_samples(batch_inds, horizon, dilation, env=env)
 
-    def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+    def _get_samples(self, batch_inds: np.ndarray, horizon: int, dilation: int, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
         next_obs = self._normalize_obs(self.observations[(batch_inds + 1) % self.buffer_size, 0, :], env)
 
-        observations = [self.observations[batch_inds-i, 0, :] for i in reversed(range(self.horizon))]
-        actions = [self.actions[batch_inds-i, 0, :] for i in reversed(range(self.horizon))]
+        observations = [self.observations[batch_inds-(i*dilation), 0, :] for i in reversed(range(horizon+1))]
+        actions = [self.actions[batch_inds-(i*dilation), 0, :] for i in reversed(range(horizon+1))]
         observations = np.stack(observations)
         actions = np.stack(actions)
 

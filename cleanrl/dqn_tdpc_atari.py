@@ -87,6 +87,8 @@ class Args:
     """the discount factor gamma for pc"""
     horizon: int = 1
     """the horizon of the prediction"""
+    dilation: int = 5
+    """the space between steps in a trajectory"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -170,14 +172,8 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(512, self.n_action_space),
         )
-
-    def predict_next_state(self, obs, action):
-        action = F.one_hot(action.long(), num_classes=self.n_action_space).float()#.squeeze(1).squeeze(2)
-        if action.dim() == 3:
-            action = action.squeeze(1)
-        elif action.dim() == 4:
-            action = action.squeeze(2)
-
+    
+    def encode(self, obs):
         if obs.dim() == 5:
             seq_len = obs.shape[0]
             obs = obs.view(-1, *obs.shape[2:])
@@ -185,11 +181,22 @@ class QNetwork(nn.Module):
             z = z.view(seq_len, -1, *z.shape[1:])
         else:
             z = self.encoder(obs)
+        return z
+
+    def predict_next_latent(self, z, action):
+        action = F.one_hot(action.long(), num_classes=self.n_action_space).float()#.squeeze(1).squeeze(2)
+        if action.dim() == 3:
+            action = action.squeeze(1)
+        elif action.dim() == 4:
+            action = action.squeeze(2)
 
         a = self.action_encoder(action.float())
         z = torch.cat([z, a], dim=-1)
         z = self.transition(z)
 
+        return z
+    
+    def reconstruct(self, z):
         if z.dim() == 3:
             seq_len = z.shape[0]
             z = z.view(-1, *z.shape[2:])
@@ -199,9 +206,8 @@ class QNetwork(nn.Module):
             pred = self.decoder(z)
         return pred
 
-    def forward(self, x):
-        x = x
-        z = self.encoder(x)
+    def forward(self, obs):
+        z = self.encode(obs)
         return self.network(z.detach())
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
@@ -263,7 +269,6 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
-        args.horizon,
         device,
     )
     start_time = time.time()
@@ -314,28 +319,35 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
-                data = rb.sample(args.batch_size)
+                data = rb.sample(args.batch_size, args.horizon, args.dilation)
+
+                # DQN
                 with torch.no_grad():
                     target_max, _ = target_network(data.next_observations/255.0).max(dim=1)
                     td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
-                
                 enc = q_network.encoder(data.observations[-1] / 255.0)
                 old_val = q_network.network(enc.detach()).gather(1, data.actions[-1]).squeeze()
                 td_loss = F.mse_loss(td_target, old_val)
 
-                recon_loss = 0
-                norm = 0
-                targets = torch.cat([data.observations[1:], data.next_observations.unsqueeze(0)], dim=0) / 255.0
-                states = data.observations / 255.0
-                acts = data.actions
+                # TDPC
+                targets = data.observations[1:] / 255.0
+                acts = data.actions[:-1]
+                latent_state = q_network.encode(data.observations[:-1] / 255.0)
+                # # AE loss
+                # recon_loss = F.binary_cross_entropy(q_network.reconstruct(latent_state), data.observations / 255.0)
+                # norm = 1.0
+                recon_loss = 0.0
+                norm = 0.0
+                # PAE loss
                 for i in range(args.horizon):
-                    states = q_network.predict_next_state(states, acts)
-                    recon_loss += F.binary_cross_entropy(states, targets) * args.pc_gamma ** i
+                    latent_state = q_network.predict_next_latent(latent_state, acts)
+                    preds = q_network.reconstruct(latent_state)
+                    recon_loss += F.binary_cross_entropy(preds, targets) * args.pc_gamma ** i
                     norm += args.pc_gamma ** i
 
                     targets = targets[1:]
-                    states = states[:-1]
                     acts = acts[1:]
+                    latent_state = latent_state[:-1]
                 recon_loss /= norm
 
                 if global_step % 100 == 0:
@@ -362,7 +374,9 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
         # Prediction eval
         if global_step % 100000 == 0:
             for idx, (obs, action, next_obs) in enumerate(transitions):
-                pred_next_obs = q_network.predict_next_state(torch.Tensor(obs).to(device), torch.Tensor(action).to(device)).cpu().detach().numpy()
+                z = q_network.encode(torch.Tensor(obs).to(device) / 255.0)
+                z = q_network.predict_next_latent(z, torch.Tensor(action).to(device))
+                pred_next_obs = q_network.reconstruct(z).detach().cpu().numpy()
                 writer.add_image(f"state prediction/{idx}", (pred_next_obs[0] * 255.0).clip(0, 255).astype(np.uint8), global_step, dataformats="CHW")
 
     if args.save_model:
